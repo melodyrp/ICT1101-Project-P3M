@@ -10,10 +10,11 @@ import wave
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'Speech'))
 try:
-    import speech          # Julia's Piper TTS
-except ImportError:
+    import speech    # type: ignore  # Julia's Piper TTS
+except Exception:
     speech = None
 
+print('Voice: Piper' if speech else 'Voice: Windows (Piper not available)')
 
 BASE = Path(__file__).resolve().parent
 PORT = 5555
