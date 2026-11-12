@@ -7,6 +7,14 @@ import subprocess
 import time
 import wave
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'Speech'))
+try:
+    import speech          # Julia's Piper TTS
+except ImportError:
+    speech = None
+
+
 BASE = Path(__file__).resolve().parent
 PORT = 5555
 TTS_SCRIPT = r'''
@@ -27,6 +35,17 @@ def synthesize(text):
         raise ValueError('Use basic English characters for this version.') from None
     if not encoded or len(encoded) > 160 or any(v < 32 or v > 126 for v in encoded):
         raise ValueError('Use 1-160 basic English characters on one line.')
+
+    # --- Test Julia's Piper voice ---
+    if speech is not None:
+        try:
+            pcm = speech.text_to_pcm(text)
+            if pcm and len(pcm) <= 480000:
+                return encoded, pcm
+        except Exception as error:
+            print('Piper failed, using Windows voice:', error)
+    # --- end of new part ---
+
     directory = BASE / 'generated'
     directory.mkdir(exist_ok=True)
     path = directory / 'last-sentence.wav'
