@@ -93,6 +93,10 @@ class Controller:
         self.captioning = threading.Event()  # STT is on
         self.running = True
         self.unita = UnitALink(unita_ip, self.on_unita_event, report=log) if unita_ip else None
+        self.sign_receiver = (
+            SignReceiver(self.on_sign_sentence, host=sign_host, port=sign_port, report=log)
+            if sign_enabled else None
+        )
 
     # ---------- inputs ----------
     def on_sign_sentence(self, text):
@@ -223,6 +227,8 @@ class Controller:
             log(f'[tts] warm-up failed: {error}')
         if self.unita:
             self.unita.start()
+        if self.sign_receiver:
+            self.sign_receiver.start()
         threading.Thread(target=self.speaker_worker, daemon=True).start()
         threading.Thread(target=self.caption_worker, daemon=True).start()
         log(f'Unit B {self.unitb_ip}: ' + ('reachable' if unitb_client.ping(self.unitb_ip) else 'NOT reachable yet'))
@@ -250,6 +256,8 @@ class Controller:
             self.cv.notify_all()
         if self.unita:
             self.unita.stop()
+        if self.sign_receiver:
+            self.sign_receiver.stop()
         log('backend stopped')
 
 
