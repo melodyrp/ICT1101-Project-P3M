@@ -27,6 +27,7 @@ from pathlib import Path
 
 import unitb_client
 from unita_link import UnitALink
+from sign_receiver import SignReceiver
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -82,7 +83,7 @@ def stt_real():
 #  Controller
 # =====================================================================
 class Controller:
-    def __init__(self, unitb_ip, unita_ip, tts, stt):
+    def __init__(self, unitb_ip, unita_ip, tts, stt, sign_host='127.0.0.1', sign_port=5560, sign_enabled=True):
         self.unitb_ip = unitb_ip
         self.tts, self.stt = tts, stt
         self.pending = deque()               # sentences waiting for Unit B
@@ -91,6 +92,10 @@ class Controller:
         self.captioning = threading.Event()  # STT is on
         self.running = True
         self.unita = UnitALink(unita_ip, self.on_unita_event, report=log) if unita_ip else None
+        self.sign_receiver = (
+            SignReceiver(self.on_sign_sentence, host=sign_host, port=sign_port, report=log)
+            if sign_enabled else None
+        )
 
     # ---------- inputs ----------
     def on_sign_sentence(self, text):
@@ -212,10 +217,14 @@ class Controller:
             log(f'[tts] warm-up failed: {error}')
         if self.unita:
             self.unita.start()
+        if self.sign_receiver:
+            self.sign_receiver.start()
         threading.Thread(target=self.speaker_worker, daemon=True).start()
         threading.Thread(target=self.caption_worker, daemon=True).start()
         log(f'Unit B {self.unitb_ip}: ' + ('reachable' if unitb_client.ping(self.unitb_ip) else 'NOT reachable yet'))
-        print('\nType a sentence (= pretend signing). Commands: /start /stop /undo /quit\n')
+        print('\nPerson 1 webcam sentences are accepted on TCP port 5560.\n'
+              'You can still type a sentence here as a manual fallback.\n'
+              'Commands: /start /stop /undo /quit\n')
         try:
             while True:
                 line = input().strip()
@@ -237,6 +246,8 @@ class Controller:
             self.cv.notify_all()
         if self.unita:
             self.unita.stop()
+        if self.sign_receiver:
+            self.sign_receiver.stop()
         log('backend stopped')
 
 
@@ -246,12 +257,18 @@ def main():
     p.add_argument('--unita', default='127.0.0.1', help="Unit A IP, or 'none' to run without it")
     p.add_argument('--tts', choices=['real', 'beep'], default='real')
     p.add_argument('--stt', choices=['real', 'fake'], default='fake')
+    p.add_argument('--sign-host', default='127.0.0.1', help='Person 1 sign receiver bind address')
+    p.add_argument('--sign-port', type=int, default=5560, help='Person 1 sign receiver TCP port')
+    p.add_argument('--no-sign', action='store_true', help='disable Person 1 TCP receiver')
     a = p.parse_args()
     Controller(
         unitb_ip=a.unitb,
         unita_ip=None if a.unita.lower() == 'none' else a.unita,
         tts=tts_real if a.tts == 'real' else tts_beep,
         stt=stt_real if a.stt == 'real' else stt_fake,
+        sign_host=a.sign_host,
+        sign_port=a.sign_port,
+        sign_enabled=not a.no_sign,
     ).run()
 
 
