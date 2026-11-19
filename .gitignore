@@ -1,6 +1,8 @@
 venv/
+.venv/
 __pycache__/
 *.onnx
 *.onnx.json
 *.wav
-arduino_secrets.hBackend/fake_output/
+arduino_secrets.h
+Backend/fake_output/

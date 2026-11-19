@@ -53,7 +53,7 @@ def load_config() -> dict:
         ],
     }
     if CONFIG_PATH.exists():
-        cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+        cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig")))
     return cfg
 
 
@@ -182,11 +182,11 @@ def import_external_normalizer(external_repo: Path):
 
 
 def fallback_normalize(points: np.ndarray) -> np.ndarray:
-    """Wrist-centred + hand-size normalization."""
+    """Must match the upstream training: wrist at origin,
+    scaled by the wrist -> middle-finger MCP (point 9) distance."""
     pts = points.astype(np.float32).copy()
     pts -= pts[0]
-    # Use the furthest landmark distance as a stable hand-size estimate.
-    scale = float(np.max(np.linalg.norm(pts, axis=1)))
+    scale = float(np.linalg.norm(pts[9]))
     if scale > 1e-6:
         pts /= scale
     return pts.reshape(-1)
@@ -232,6 +232,8 @@ def main():
     hand_model_path = find_hand_model(cfg, repo)
     model = load_model(repo / "models" / "asl_landmark_mlp.pth")
     encoder = load_label_encoder(repo / "landmark_label_encoder.pkl")
+    labels = [decode_label(encoder, i) for i in range(len(encoder.classes_))]
+    letter_mask = torch.tensor([l.isalpha() and len(l) == 1 for l in labels])
     normalizers = import_external_normalizer(repo)
 
     print(f"[Fingerspell] Model repo: {repo}")
@@ -247,17 +249,17 @@ def main():
         base_options=BaseOptions(model_asset_path=str(hand_model_path)),
         running_mode=RunningMode.VIDEO,
         num_hands=1,
-        min_hand_detection_confidence=0.5,
-        min_hand_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
+        min_hand_detection_confidence=0.7,
+        min_hand_presence_confidence=0.7,
+        min_tracking_confidence=0.7,
     )
 
     cap = cv2.VideoCapture(int(cfg.get("camera_index", 0)))
     if not cap.isOpened():
         raise RuntimeError("Could not open webcam.")
 
-    threshold = float(cfg.get("confidence_threshold", 0.80))
-    stable_needed = int(cfg.get("stable_frames", 12))
+    threshold = float(cfg.get("confidence_threshold", 0.85))
+    stable_needed = int(cfg.get("stable_frames", 10))
     release_needed = int(cfg.get("release_frames", 6))
 
     current_word = ""
@@ -289,17 +291,22 @@ def main():
                 hand = result.hand_landmarks[0]
                 draw_hand(frame, hand)
                 points = np.array([[lm.x, lm.y, lm.z] for lm in hand], dtype=np.float32)
+                near_edge = (points[:, 0].min() < 0.02 or points[:, 0].max() > 0.98 or
+                points[:, 1].min() < 0.02 or points[:, 1].max() > 0.98)
                 features = normalize_points(points, normalizers)
                 x = torch.from_numpy(features).float().unsqueeze(0)
 
                 with torch.no_grad():
                     logits = model(x)
+                    logits[0, ~letter_mask] = float("-inf")   # ignore digits 0-9
                     probs = torch.softmax(logits, dim=-1)[0]
                     conf, idx = torch.max(probs, dim=0)
+                    top2 = torch.topk(probs, 2).values
+                margin_ok = float(top2[0] - top2[1]) >= 0.3
 
                 latest_conf = float(conf.item())
                 latest_letter = decode_label(encoder, int(idx.item()))
-                valid_prediction = latest_letter.isalpha() and len(latest_letter) == 1 and latest_conf >= threshold
+                valid_prediction = (latest_letter.isalpha() and len(latest_letter) == 1 and latest_conf >= threshold and margin_ok and not near_edge)
 
                 if valid_prediction:
                     if latest_letter == candidate:
