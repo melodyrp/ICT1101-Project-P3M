@@ -50,9 +50,10 @@ def tts_beep(text):
 def tts_real(text):
     """Piper (Julia's speech.py), falling back to the Windows voice.
     Reuses Melody's synthesize() so both senders behave the same."""
-    sys.path.insert(0, str(ROOT / 'UnitB' / 'UnitB_WiFiSpeech'))
-    import wifi_sender
-    return wifi_sender.synthesize(text)[1]
+    sys.path.insert(0, str(ROOT / "Speech"))
+    import speech
+    return speech.text_to_pcm(text)
+  
 
 
 # ---- STT (Person 5) : listen once, return what the hearing person said ----
@@ -92,10 +93,6 @@ class Controller:
         self.captioning = threading.Event()  # STT is on
         self.running = True
         self.unita = UnitALink(unita_ip, self.on_unita_event, report=log) if unita_ip else None
-        self.sign_receiver = (
-            SignReceiver(self.on_sign_sentence, host=sign_host, port=sign_port, report=log)
-            if sign_enabled else None
-        )
 
     # ---------- inputs ----------
     def on_sign_sentence(self, text):
@@ -129,11 +126,19 @@ class Controller:
 
     # ---------- actions ----------
     def start_captions(self):
+        if self.captioning.is_set():
+            log('[stt] captions already ON')
+            return
+
         self.captioning.set()
         self._status('LISTENING')
         log('[stt] captions ON')
 
     def stop_captions(self):
+        if not self.captioning.is_set():
+            log('[stt] captions already OFF')
+            return
+        
         self.captioning.clear()
         self._status('IDLE')
         log('[stt] captions OFF')
@@ -146,6 +151,7 @@ class Controller:
             self._caption(f'Undone: {removed}')
         else:
             log('[undo] nothing to undo (already spoken or queue empty)')
+            self._caption('Nothing to undo')
 
     def _caption(self, text):
         if self.unita:
@@ -217,8 +223,6 @@ class Controller:
             log(f'[tts] warm-up failed: {error}')
         if self.unita:
             self.unita.start()
-        if self.sign_receiver:
-            self.sign_receiver.start()
         threading.Thread(target=self.speaker_worker, daemon=True).start()
         threading.Thread(target=self.caption_worker, daemon=True).start()
         log(f'Unit B {self.unitb_ip}: ' + ('reachable' if unitb_client.ping(self.unitb_ip) else 'NOT reachable yet'))
@@ -246,8 +250,6 @@ class Controller:
             self.cv.notify_all()
         if self.unita:
             self.unita.stop()
-        if self.sign_receiver:
-            self.sign_receiver.stop()
         log('backend stopped')
 
 
