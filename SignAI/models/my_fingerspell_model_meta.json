@@ -1,0 +1,41 @@
+{
+  "model": "63-128-64-AZ MLP",
+  "normalization": "wrist-centred, scaled by maximum landmark distance",
+  "samples": 1560,
+  "classes": [
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
+    "H",
+    "I",
+    "J",
+    "K",
+    "L",
+    "M",
+    "N",
+    "O",
+    "P",
+    "Q",
+    "R",
+    "S",
+    "T",
+    "U",
+    "V",
+    "W",
+    "X",
+    "Y",
+    "Z"
+  ],
+  "sessions": [
+    "1"
+  ],
+  "validation_split": "random frame split (only one session; validation may be optimistic)",
+  "validation_accuracy": 0.9967948717948718,
+  "best_validation_accuracy": 0.9967948794364929,
+  "epochs": 80,
+  "note": "J and Z are motion-based ASL letters and remain a limitation of static-frame classification."
+}

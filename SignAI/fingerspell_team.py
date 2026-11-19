@@ -230,9 +230,21 @@ def main():
     cfg = load_config()
     repo = find_external_repo(cfg)
     hand_model_path = find_hand_model(cfg, repo)
-    model = load_model(repo / "models" / "asl_landmark_mlp.pth")
-    encoder = load_label_encoder(repo / "landmark_label_encoder.pkl")
-    normalizers = import_external_normalizer(repo)
+
+    personal_model = HERE / "models" / "my_fingerspell_model.pth"
+    personal_encoder = HERE / "models" / "my_fingerspell_label_encoder.pkl"
+    using_personal = personal_model.exists() and personal_encoder.exists()
+
+    if using_personal:
+        model = load_model(personal_model)
+        encoder = load_label_encoder(personal_encoder)
+        normalizers = None
+        print(f"[Fingerspell] Using PERSONAL model: {personal_model}")
+    else:
+        model = load_model(repo / "models" / "asl_landmark_mlp.pth")
+        encoder = load_label_encoder(repo / "landmark_label_encoder.pkl")
+        normalizers = import_external_normalizer(repo)
+        print(f"[Fingerspell] Using pretrained model from: {repo}")
 
     print(f"[Fingerspell] Model repo: {repo}")
     print(f"[Fingerspell] Hand model: {hand_model_path}")
@@ -289,7 +301,9 @@ def main():
                 hand = result.hand_landmarks[0]
                 draw_hand(frame, hand)
                 points = np.array([[lm.x, lm.y, lm.z] for lm in hand], dtype=np.float32)
-                features = normalize_points(points, normalizers)
+                # The personal model is trained with fallback_normalize(), so use
+                # the exact same feature preparation at inference time.
+                features = fallback_normalize(points) if using_personal else normalize_points(points, normalizers)
                 x = torch.from_numpy(features).float().unsqueeze(0)
 
                 with torch.no_grad():
