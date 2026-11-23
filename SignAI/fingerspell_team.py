@@ -25,6 +25,7 @@ import json
 import pickle
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -53,7 +54,7 @@ def load_config() -> dict:
         ],
     }
     if CONFIG_PATH.exists():
-        cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+        cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig")))
     return cfg
 
 
@@ -192,6 +193,20 @@ def fallback_normalize(points: np.ndarray) -> np.ndarray:
     return pts.reshape(-1)
 
 
+def upstream_normalize(points: np.ndarray) -> np.ndarray:
+    """Normalization used to TRAIN the pretrained upstream model
+    (ronronrivera/real-time-asl-detection, src/landmark_utils.py):
+    wrist at origin, scaled by the wrist -> middle-finger MCP (point 9) distance.
+    Use this for the pretrained model only. The personal model and
+    collect_letters.py use fallback_normalize() above."""
+    pts = points.astype(np.float32).copy()
+    pts -= pts[0]
+    scale = float(np.linalg.norm(pts[9]))
+    if scale > 1e-6:
+        pts /= scale
+    return pts.reshape(-1)
+
+
 def normalize_points(points: np.ndarray, normalizers) -> np.ndarray:
     if normalizers:
         test_inputs = [points, points.tolist(), points.reshape(-1)]
@@ -204,7 +219,7 @@ def normalize_points(points: np.ndarray, normalizers) -> np.ndarray:
                         return arr
                 except Exception:
                     pass
-    return fallback_normalize(points)
+    return upstream_normalize(points)
 
 
 def decode_label(encoder, index: int) -> str:
@@ -246,6 +261,11 @@ def main():
         normalizers = import_external_normalizer(repo)
         print(f"[Fingerspell] Using pretrained model from: {repo}")
 
+    # Ignore digit classes (0 looks like O, 2 like V ...). Other classes such as
+    # NOTHING (relaxed hand / transitions) stay, but are never typed.
+    labels = [decode_label(encoder, i) for i in range(len(encoder.classes_))]
+    letter_mask = torch.tensor([not l.isdigit() for l in labels])
+
     print(f"[Fingerspell] Model repo: {repo}")
     print(f"[Fingerspell] Hand model: {hand_model_path}")
     print("[Fingerspell] Controls: SPACE word | BACKSPACE delete | C clear | ENTER send | Q quit")
@@ -259,9 +279,9 @@ def main():
         base_options=BaseOptions(model_asset_path=str(hand_model_path)),
         running_mode=RunningMode.VIDEO,
         num_hands=1,
-        min_hand_detection_confidence=0.5,
-        min_hand_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
+        min_hand_detection_confidence=0.7,
+        min_hand_presence_confidence=0.7,
+        min_tracking_confidence=0.7,
     )
 
     cap = cv2.VideoCapture(int(cfg.get("camera_index", 0)))
@@ -280,6 +300,7 @@ def main():
     release_frames = release_needed
     latest_conf = 0.0
     latest_letter = ""
+    recent_probs: deque = deque(maxlen=int(cfg.get("smooth_frames", 5)))
     started = time.monotonic()
 
     with HandLandmarker.create_from_options(options) as landmarker:
@@ -301,6 +322,9 @@ def main():
                 hand = result.hand_landmarks[0]
                 draw_hand(frame, hand)
                 points = np.array([[lm.x, lm.y, lm.z] for lm in hand], dtype=np.float32)
+                # ignore hands entering/leaving the frame (stops random Q/P letters)
+                near_edge = (points[:, 0].min() < 0.02 or points[:, 0].max() > 0.98 or
+                             points[:, 1].min() < 0.02 or points[:, 1].max() > 0.98)
                 # The personal model is trained with fallback_normalize(), so use
                 # the exact same feature preparation at inference time.
                 features = fallback_normalize(points) if using_personal else normalize_points(points, normalizers)
@@ -308,12 +332,17 @@ def main():
 
                 with torch.no_grad():
                     logits = model(x)
-                    probs = torch.softmax(logits, dim=-1)[0]
+                    logits[0, ~letter_mask] = float("-inf")   # ignore digits 0-9
+                    recent_probs.append(torch.softmax(logits, dim=-1)[0])
+                    probs = torch.stack(list(recent_probs)).mean(dim=0)   # smooth over last few frames
                     conf, idx = torch.max(probs, dim=0)
+                    top2 = torch.topk(probs, 2).values
+                margin_ok = float(top2[0] - top2[1]) >= 0.3   # model must be clearly sure
 
                 latest_conf = float(conf.item())
                 latest_letter = decode_label(encoder, int(idx.item()))
-                valid_prediction = latest_letter.isalpha() and len(latest_letter) == 1 and latest_conf >= threshold
+                valid_prediction = (latest_letter.isalpha() and len(latest_letter) == 1
+                                    and latest_conf >= threshold and margin_ok and not near_edge)
 
                 if valid_prediction:
                     if latest_letter == candidate:
@@ -337,7 +366,12 @@ def main():
                     candidate = ""
                     candidate_frames = 0
                     release_frames = min(release_needed, release_frames + 1)
+                    # a pause / relaxed hand between two identical letters allows
+                    # double letters (e.g. HELLO, BOOK) without moving the hand away
+                    if release_frames >= release_needed:
+                        last_committed = ""
             else:
+                recent_probs.clear()
                 candidate = ""
                 candidate_frames = 0
                 release_frames = min(release_needed, release_frames + 1)

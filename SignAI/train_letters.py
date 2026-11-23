@@ -58,6 +58,34 @@ def load_dataset(path: Path):
     return np.asarray(features, dtype=np.float32), np.asarray(labels), np.asarray(sessions)
 
 
+def augment(xb: torch.Tensor, mirror: bool) -> torch.Tensor:
+    """Make each training batch look slightly different so the model copes with
+    other people's hands, angles and distances instead of memorising one session.
+    Features are 21 landmarks x (x, y, z), wrist-centred and scaled."""
+    pts = xb.reshape(-1, 21, 3).clone()
+    n = pts.shape[0]
+    # random in-plane rotation (+/- 15 degrees) - hand tilted a little
+    ang = (torch.rand(n) * 2 - 1) * (15 * np.pi / 180)
+    c, s = torch.cos(ang), torch.sin(ang)
+    x, y = pts[:, :, 0].clone(), pts[:, :, 1].clone()
+    pts[:, :, 0] = c[:, None] * x - s[:, None] * y
+    pts[:, :, 1] = s[:, None] * x + c[:, None] * y
+    # random scale per axis (+/- 8%) - different hand proportions
+    pts *= 1 + (torch.rand(n, 1, 3) * 2 - 1) * 0.08
+    # small jitter on every landmark - tracking noise
+    pts += torch.randn_like(pts) * 0.015
+    # mirror half the samples - left-handed signers
+    if mirror:
+        flip = torch.rand(n) < 0.5
+        pts[flip, :, 0] *= -1
+    # re-apply the same normalization as fallback_normalize(): wrist at origin,
+    # furthest landmark at distance 1 (live webcam features always look like this)
+    pts -= pts[:, :1, :].clone()
+    scale = pts.norm(dim=2).max(dim=1).values.clamp_min(1e-6)
+    pts /= scale[:, None, None]
+    return pts.reshape(-1, 63)
+
+
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -79,6 +107,12 @@ def main():
     parser.add_argument("--batch", type=int, default=64)
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no-augment", action="store_true", help="Disable training data augmentation")
+    parser.add_argument("--no-mirror", action="store_true", help="Do not add mirrored (left-hand) samples")
+    parser.add_argument("--val-session", default=None,
+                        help="Session to hold out for testing, e.g. julia1. Everything else is used for training.")
+    parser.add_argument("--final", action="store_true",
+                        help="Train on ALL sessions for the demo model (accuracy shown is not a fair test).")
     args = parser.parse_args()
 
     if not args.data.exists():
@@ -101,7 +135,16 @@ def main():
     y = encoder.fit_transform(labels)
 
     unique_sessions = np.unique(sessions)
-    if len(unique_sessions) >= 2:
+    if args.final:
+        train_idx = val_idx = np.arange(len(X))
+        split_note = "final model trained on all sessions (no held-out test)"
+    elif args.val_session is not None:
+        if args.val_session not in set(sessions.tolist()):
+            raise RuntimeError(f"--val-session {args.val_session} not found. Sessions: {', '.join(unique_sessions)}")
+        val_idx = np.where(sessions == args.val_session)[0]
+        train_idx = np.where(sessions != args.val_session)[0]
+        split_note = f"held-out session '{args.val_session}' (trained on the other sessions)"
+    elif len(unique_sessions) >= 2:
         splitter = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=args.seed)
         train_idx, val_idx = next(splitter.split(X, y, groups=sessions))
         split_note = f"group split by collection session ({len(unique_sessions)} sessions)"
@@ -137,6 +180,8 @@ def main():
         running_loss = 0.0
         for xb, yb in loader:
             optimizer.zero_grad()
+            if not args.no_augment:
+                xb = augment(xb, mirror=not args.no_mirror)
             logits = model(xb)
             loss = criterion(logits, yb)
             loss.backward()
@@ -174,7 +219,8 @@ def main():
     save_confusion(CONFUSION_PATH, cm, classes)
 
     meta = {
-        "model": "63-128-64-AZ MLP",
+        "model": "63-128-64 MLP (A-Z" + (" + NOTHING" if "NOTHING" in classes else "") + ")",
+        "augmentation": "off" if args.no_augment else ("rotation, scale, jitter" + ("" if args.no_mirror else ", mirror")),
         "normalization": "wrist-centred, scaled by maximum landmark distance",
         "samples": int(len(X)),
         "classes": classes,

@@ -1,4 +1,4 @@
-"""Collect your own ASL A-Z landmark samples from the webcam.
+r"""Collect your own ASL A-Z landmark samples from the webcam.
 
 Usage examples:
     python .\SignAI\collect_letters.py --session 1 --target 60
@@ -7,6 +7,8 @@ Usage examples:
 
 Controls in the webcam window:
     A-Z   : select the letter you want to record
+    0     : select NOTHING (relaxed hand, hand moving between letters, scratching
+            your face...) so the model learns when NOT to type a letter
     SPACE : start/stop recording for the selected letter
     ESC   : quit and save
 
@@ -144,7 +146,7 @@ def main() -> None:
             cv2.rectangle(frame, (0, 0), (frame.shape[1], 130), (20, 20, 20), -1)
             cv2.putText(frame, f"PERSONAL DATA | Session {args.session}", (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.66, (255,255,255), 2)
             cv2.putText(frame, f"Letter: {selected}   {counts[selected]}/{args.target}   {status}", (15, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (0,255,0) if recording else (255,255,255), 2)
-            cv2.putText(frame, "A-Z select | SPACE record/pause | ESC quit", (15, 92), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255,255,255), 1)
+            cv2.putText(frame, "A-Z select | 0 NOTHING | SPACE record/pause | ESC quit", (15, 92), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255,255,255), 1)
             cv2.putText(frame, "Vary angle/distance slightly while recording", (15, 118), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255,255,255), 1)
 
             cv2.imshow("Collect Personal ASL Letters", frame)
@@ -160,6 +162,12 @@ def main() -> None:
                     recording = not recording
                     detected_frame_count = 0
                     print(f"[Collect] {selected}: {'RECORDING' if recording else 'PAUSED'}")
+            elif key == ord("0"):
+                selected = "NOTHING"
+                recording = False
+                detected_frame_count = 0
+                print(f"[Collect] Selected NOTHING: {counts[selected]}/{args.target}")
+                print("[Collect] Record relaxed hands, half-formed shapes and moving between letters.")
             elif ord("a") <= key <= ord("z"):
                 selected = chr(key).upper()
                 recording = False
@@ -170,7 +178,7 @@ def main() -> None:
     cv2.destroyAllWindows()
 
     print("\n[Collect] Session totals:")
-    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+    for letter in [*"ABCDEFGHIJKLMNOPQRSTUVWXYZ", "NOTHING"]:
         print(f"  {letter}: {counts[letter]}")
     print(f"[Collect] Saved: {DATA_PATH}")
     print("[Collect] J and Z use motion in real ASL, so a static-frame model will remain weaker on them.")
