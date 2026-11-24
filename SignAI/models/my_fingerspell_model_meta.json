@@ -1,0 +1,43 @@
+{
+  "model": "63-128-64 MLP (A-Z)",
+  "augmentation": "rotation, scale, jitter, mirror",
+  "normalization": "wrist-centred, scaled by maximum landmark distance",
+  "samples": 9360,
+  "classes": [
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
+    "H",
+    "I",
+    "J",
+    "K",
+    "L",
+    "M",
+    "N",
+    "O",
+    "P",
+    "Q",
+    "R",
+    "S",
+    "T",
+    "U",
+    "V",
+    "W",
+    "X",
+    "Y",
+    "Z"
+  ],
+  "sessions": [
+    "1",
+    "kaggle"
+  ],
+  "validation_split": "final model trained on all sessions (no held-out test)",
+  "validation_accuracy": 0.9792735042735042,
+  "best_validation_accuracy": 0.9792734980583191,
+  "epochs": 150,
+  "note": "J and Z are motion-based ASL letters and remain a limitation of static-frame classification."
+}

@@ -1,0 +1,6 @@
+{
+  "backend_host": "127.0.0.1",
+  "backend_port": 5560,
+  "connect_timeout_seconds": 2.0,
+  "prediction_log": "logs/person1_predictions.jsonl"
+}

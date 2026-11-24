@@ -7,7 +7,7 @@ so the laptop only needs the two IP addresses.
 | Unit | Port | Connection style | Status |
 |---|---|---|---|
 | Unit B (speaker, Melody) | 5555 | one connection per sentence | **working** (`UnitB_WiFiSpeech.ino`) |
-| Unit A (captions + buttons, Jodie) | 5556 | one long-lived connection | **DRAFT — agree with Jodie** |
+| Unit A (spelling screen + buttons, Jodie) | 5556 | one long-lived connection | **working** (`UnitA_WiFi.ino`) |
 
 All text lines are ASCII ending in `\n`. Text shown on screens: printable
 ASCII (32–126) only, max 160 characters.
@@ -39,7 +39,12 @@ Laptop code: [unitb_client.py](unitb_client.py) → `send(ip, text, pcm)`.
 
 ---
 
-## Unit A — UNITA_WIFI_V1 (draft)
+## Unit A — UNITA_WIFI_V2 (captions + fingerspelling, working: `UnitA/UnitA_WiFi`)
+
+The sign model recognises **one letter at a time**. The laptop keeps the
+letters spelled so far (the *spelling buffer*) and shows them on Unit A.
+Unit A's buttons edit the buffer. The top of the screen shows live captions
+(what the hearing person said, STT), the bottom shows the spelling buffer.
 
 Unit A has buttons, so it must be able to send messages at any time. The
 laptop therefore keeps one connection open and reconnects every 2 s if it drops.
@@ -47,39 +52,35 @@ laptop therefore keeps one connection open and reconnects every 2 s if it drops.
 **Handshake**
 ```
 Laptop: HELLO
-Unit A: UNITA_WIFI_V1
+Unit A: UNITA_WIFI_V2
 ```
 
 **Laptop → Unit A**
 
 | Message | Meaning on Unit A |
 |---|---|
-| `CAPTION <text>` | show what the hearing person said (STT result) |
-| `STATUS <WORD>` | small status line: `IDLE`, `LISTENING`, `SPEAKING` |
-| `CLEAR` | clear the caption area |
+| `CAPTION <text>` | what the hearing person said (STT). Empty = clear the caption |
+| `TEXT <letters>` | the whole spelling buffer (may be empty, may end with a space). Sent after every change and on every (re)connect |
+| `SENT <sentence>` | the sentence just sent to Unit B; shown as "Spoken:" until the next letter |
+| `STATUS <WORD>` | status line: `IDLE`, `LISTENING`, `SPEAKING`, `NO UNIT B` |
+| `CLEAR` | clear the screen text |
 | `PING` | heartbeat every 5 s, reply `PONG` |
 
 **Unit A → Laptop**
 
-| Message | When |
-|---|---|
-| `BTN START` | start button: turn live captions on |
-| `BTN STOP` | stop button: turn live captions off |
-| `BTN UNDO` | undo: cancel the last signed sentence if it hasn't been spoken yet |
-| `TOF NEAR` / `TOF FAR` | user comes in front of / leaves the device (send only on change) |
-| `PONG` | reply to `PING` |
+| Message | Button | Laptop does |
+|---|---|---|
+| `BTN START` / `BTN STOP` | built-in upper-left (toggle) | live captions on / off |
+| `BTN SPACE` | built-in lower-left, tap | add one space (no leading or double spaces) |
+| `BTN SEND` | built-in lower-left held 1 s, or upper-right | speak the buffer on Unit B, then empty it |
+| `BTN UNDO` | built-in lower-right, or Wireling Port 1 | delete the last letter (or space) |
+| `PONG` | – | reply to `PING` |
 
 If the laptop hears nothing for 15 s (so not even a `PONG`), it treats the
-link as dead and reconnects. Unit A should do the same: if it gets no `PING`
-for 15 s, close the client and wait for a new connection.
+link as dead and reconnects. Unit A does the same: if it gets no `PING`
+for 15 s, it closes the client and waits for a new connection.
 
 Laptop code: [unita_link.py](unita_link.py).
-
-### Open questions for the team
-1. What should START/STOP actually control: live captions (current draft), sign recognition, or both?
-2. What should ToF do: wake the screen, start sign recognition automatically, or nothing?
-3. Long captions: should Unit A scroll them, or should the laptop split them into screen-sized pieces?
-4. What exactly can UNDO undo: only sentences still in the queue (current draft), or also the last sign word while someone is still signing (needs P1)?
 
 ---
 
@@ -87,6 +88,6 @@ Laptop code: [unita_link.py](unita_link.py).
 
 | From | Function the backend calls / expects | Notes |
 |---|---|---|
-| P1 sign AI | `controller.on_sign_sentence(text)` | call once per **final** sentence |
+| P1 sign AI | `controller.on_sign_letter(ch)` | call once per recognised **letter** (one character) |
 | P5 TTS | `text_to_pcm(text) -> bytes` | already in `Speech/speech.py` |
 | P5 STT | `audio_to_text(record_audio(4)) -> str` | backend pauses STT while Unit B speaks so it doesn't caption our own TTS |

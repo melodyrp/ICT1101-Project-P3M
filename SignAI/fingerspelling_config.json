@@ -1,0 +1,16 @@
+{
+  "backend_host": "127.0.0.1",
+  "backend_port": 5560,
+  "connect_timeout_seconds": 2.0,
+  "camera_index": 0,
+  "confidence_threshold": 0.85,
+  "stable_frames": 10,
+  "release_frames": 6, 
+  "window_name": "Person 1 - ASL Fingerspelling",
+  "external_repo_relative": "..\\..\\asl_fingerspell_model",
+ "hand_model_candidates": [
+    "..\\..\\asl_fingerspell_model\\models\\hand_landmarker.task",
+    "..\\..\\sign_lang_trans\\hand_landmarker.task",
+    "hand_landmarker.task"
+  ]
+}

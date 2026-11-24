@@ -1,23 +1,24 @@
 """Main backend / conversation controller (Person 4 + Person 6).
 
 Flow:
-  Signer  --(sign AI, P1)--> sentence --(TTS, P5)--> Unit B speaks it (P3)
-  Hearing --(mic + STT, P5)--> caption --> Unit A screen (P2)
-  Unit A buttons --> START / STOP captions, UNDO last queued sentence
+  Signer  --(sign AI, P1, one letter at a time)--> spelling buffer --> shown on Unit A (P2)
+          Unit A buttons: SPACE, UNDO (one letter), SEND --> TTS (P5) --> Unit B speaks (P3)
+  Hearing --(mic + STT, P5)--> caption --> Unit A screen
+          Unit A button: START/STOP live captions
 
 Placeholders are marked TODO(P#). Each teammate replaces one function.
 
 Quick test with no hardware (3 terminals, from the Backend folder):
     python fake_unitb.py
     python fake_unita.py
-    python main.py --tts beep --stt fake
-Then type sentences here (pretend signing) and press s/t/u in fake_unita.
+    python main.py --tts beep
+Then type letters here (pretend signing) and press keys in fake_unita.
+Captions always use the real microphone + STT (needs Speech/ set up).
 
 Real hardware:
     python main.py --unitb 192.168.1.25 --unita 192.168.1.30
 """
 import argparse
-import itertools
 import math
 import sys
 import threading
@@ -29,6 +30,7 @@ import unitb_client
 from unita_link import UnitALink
 
 ROOT = Path(__file__).resolve().parents[1]
+MAX_TEXT = 160          # Unit B / Unit A limit
 
 
 def log(msg):
@@ -55,18 +57,6 @@ def tts_real(text):
 
 
 # ---- STT (Person 5) : listen once, return what the hearing person said ----
-_FAKE_LINES = itertools.cycle([
-    'Hi, how can I help you?',
-    'Sure, the toilet is on the left.',
-    'Could you repeat that please?',
-])
-
-
-def stt_fake():
-    time.sleep(4)
-    return next(_FAKE_LINES)
-
-
 def stt_real():
     sys.path.insert(0, str(ROOT / 'Speech'))
     import speech
@@ -74,8 +64,9 @@ def stt_real():
 
 
 # ---- Sign recognition (Person 1) ----
-# TODO(P1): call controller.on_sign_sentence(text) when a sentence is final.
-# Until then, sentences typed into this console are used instead (see run()).
+# TODO(P1): call controller.on_sign_letter(ch) once for every letter the model
+# is confident about (e.g. 'H'). Until then, letters typed into this console
+# are used instead (see run()).
 
 
 # =====================================================================
@@ -85,28 +76,29 @@ class Controller:
     def __init__(self, unitb_ip, unita_ip, tts, stt):
         self.unitb_ip = unitb_ip
         self.tts, self.stt = tts, stt
+        self.spelling = ''                   # letters signed so far, not yet spoken
+        self.text_lock = threading.Lock()
         self.pending = deque()               # sentences waiting for Unit B
         self.cv = threading.Condition()
         self.speaking = threading.Event()    # Unit B is playing audio
         self.captioning = threading.Event()  # STT is on
         self.running = True
-        self.unita = UnitALink(unita_ip, self.on_unita_event, report=log) if unita_ip else None
+        self.unita = UnitALink(unita_ip, self.on_unita_event, report=log,
+                               on_connect=self._push_text) if unita_ip else None
 
     # ---------- inputs ----------
-    def on_sign_sentence(self, text):
-        """Called by the sign-language module (P1) with a final sentence."""
-        text = text.strip()
-        if not text:
+    def on_sign_letter(self, ch):
+        """Called by the sign-language module (P1) with ONE recognised letter."""
+        ch = str(ch)[:1]
+        if not ch or not (32 <= ord(ch) <= 126):
             return
-        try:
-            unitb_client.check_text(text)
-        except ValueError as error:
-            log(f'[sign] rejected "{text}": {error}')
-            return
-        with self.cv:
-            self.pending.append(text)
-            self.cv.notify()
-        log(f'[sign] queued "{text}" ({len(self.pending)} waiting)')
+        with self.text_lock:
+            if len(self.spelling) >= MAX_TEXT:
+                log('[sign] buffer full, letter ignored')
+                return
+            self.spelling += ch
+        log(f'[sign] "{ch}"  -> "{self.spelling}"')
+        self._push_text()
 
     def on_unita_event(self, line):
         """Messages from Unit A (see PROTOCOL.md)."""
@@ -116,9 +108,11 @@ class Controller:
         elif line == 'BTN STOP':
             self.stop_captions()
         elif line == 'BTN UNDO':
-            self.undo()
-        elif line in ('TOF NEAR', 'TOF FAR'):
-            pass   # TODO(P2/P6): decide what presence detection should do
+            self.undo_letter()
+        elif line == 'BTN SPACE':
+            self.add_space()
+        elif line == 'BTN SEND':
+            self.send()
         else:
             log(f'[Unit A] unknown message ignored: {line!r}')
 
@@ -131,20 +125,58 @@ class Controller:
     def stop_captions(self):
         self.captioning.clear()
         self._status('IDLE')
+        if self.unita:
+            self.unita.send_caption('')
         log('[stt] captions OFF')
 
-    def undo(self):
-        with self.cv:
-            removed = self.pending.pop() if self.pending else None
-        if removed:
-            log(f'[undo] removed "{removed}" before it was spoken')
-            self._caption(f'Undone: {removed}')
-        else:
-            log('[undo] nothing to undo (already spoken or queue empty)')
+    def undo_letter(self):
+        with self.text_lock:
+            if not self.spelling:
+                log('[undo] nothing to undo')
+                return
+            removed = self.spelling[-1]
+            self.spelling = self.spelling[:-1]
+        log(f'[undo] removed {removed!r} -> "{self.spelling}"')
+        self._push_text()
 
-    def _caption(self, text):
+    def add_space(self):
+        with self.text_lock:
+            # no leading space, no double spaces
+            if not self.spelling or self.spelling.endswith(' ') or len(self.spelling) >= MAX_TEXT:
+                return
+            self.spelling += ' '
+        log(f'[space] -> "{self.spelling}"')
+        self._push_text()
+
+    def send(self):
+        """Speak whatever has been spelled, then start a new sentence."""
+        with self.text_lock:
+            text = self.spelling.strip()
+            self.spelling = ''
+        if not text:
+            log('[send] nothing to send')
+            return
+        self._push_text()
         if self.unita:
-            self.unita.send_caption(text)
+            self.unita.send_sent(text)
+        self.queue_sentence(text)
+
+    def queue_sentence(self, text):
+        try:
+            unitb_client.check_text(text)
+        except ValueError as error:
+            log(f'[send] rejected "{text}": {error}')
+            return
+        with self.cv:
+            self.pending.append(text)
+            self.cv.notify()
+        log(f'[send] queued "{text}" ({len(self.pending)} waiting)')
+
+    def _push_text(self):
+        if self.unita:
+            with self.text_lock:
+                text = self.spelling
+            self.unita.send_text(text)
 
     def _status(self, word):
         if self.unita:
@@ -169,21 +201,22 @@ class Controller:
                 continue
             self.speaking.set()
             self._status('SPEAKING')
-            try:
-                for attempt in (1, 2):
-                    try:
-                        underruns = unitb_client.send(self.unitb_ip, text, pcm,
-                                                      report=lambda m: log(m))
-                        log(f'[Unit B] done "{text}"' + (f' ({underruns} underruns)' if underruns else ''))
-                        break
-                    except Exception as error:
-                        log(f'[Unit B] attempt {attempt} failed: {error}')
-                        if attempt == 2:
-                            self._caption('Unit B not responding')
-                        else:
-                            time.sleep(2)
-            finally:
-                self.speaking.clear()
+            ok = False
+            for attempt in (1, 2):
+                try:
+                    underruns = unitb_client.send(self.unitb_ip, text, pcm,
+                                                  report=lambda m: log(m))
+                    log(f'[Unit B] done "{text}"' + (f' ({underruns} underruns)' if underruns else ''))
+                    ok = True
+                    break
+                except Exception as error:
+                    log(f'[Unit B] attempt {attempt} failed: {error}')
+                    if attempt == 1:
+                        time.sleep(2)
+            self.speaking.clear()
+            if not ok:
+                self._status('NO UNIT B')
+            else:
                 self._status('LISTENING' if self.captioning.is_set() else 'IDLE')
 
     def caption_worker(self):
@@ -201,7 +234,8 @@ class Controller:
                 continue
             if text and self.captioning.is_set() and not self.speaking.is_set():
                 log(f'[stt] "{text}"')
-                self._caption(text)
+                if self.unita:
+                    self.unita.send_caption(text)
 
     # ---------- lifecycle ----------
     def run(self):
@@ -215,21 +249,32 @@ class Controller:
         threading.Thread(target=self.speaker_worker, daemon=True).start()
         threading.Thread(target=self.caption_worker, daemon=True).start()
         log(f'Unit B {self.unitb_ip}: ' + ('reachable' if unitb_client.ping(self.unitb_ip) else 'NOT reachable yet'))
-        print('\nType a sentence (= pretend signing). Commands: /start /stop /undo /quit\n')
+        print('\nType letters + Enter (= pretend signing, each character is one letter).\n'
+              'Commands: /space /undo /send /start /stop /say <sentence> /quit\n')
         try:
             while True:
-                line = input().strip()
-                cmd = line.lower()
+                line = input()
+                cmd = line.strip().lower()
                 if cmd == '/quit':
                     break
+                elif cmd == '/space':
+                    self.add_space()
+                elif cmd == '/undo':
+                    self.undo_letter()
+                elif cmd == '/send':
+                    self.send()
                 elif cmd == '/start':
                     self.start_captions()
                 elif cmd == '/stop':
                     self.stop_captions()
-                elif cmd == '/undo':
-                    self.undo()
+                elif cmd.startswith('/say '):
+                    self.queue_sentence(line.strip()[5:].strip())
                 else:
-                    self.on_sign_sentence(line)   # TODO(P1): replace with webcam output
+                    for ch in line.strip():           # TODO(P1): replace with webcam output
+                        if ch == ' ':
+                            self.add_space()
+                        else:
+                            self.on_sign_letter(ch)
         except (EOFError, KeyboardInterrupt):
             pass
         self.running = False
@@ -245,13 +290,12 @@ def main():
     p.add_argument('--unitb', default='127.0.0.1', help='Unit B IP (default: fake on this laptop)')
     p.add_argument('--unita', default='127.0.0.1', help="Unit A IP, or 'none' to run without it")
     p.add_argument('--tts', choices=['real', 'beep'], default='real')
-    p.add_argument('--stt', choices=['real', 'fake'], default='fake')
     a = p.parse_args()
     Controller(
         unitb_ip=a.unitb,
         unita_ip=None if a.unita.lower() == 'none' else a.unita,
         tts=tts_real if a.tts == 'real' else tts_beep,
-        stt=stt_real if a.stt == 'real' else stt_fake,
+        stt=stt_real,
     ).run()
 
 

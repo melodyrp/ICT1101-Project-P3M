@@ -1,0 +1,9 @@
+# Keep the 250-sign translator's own pinned requirements as the source of truth.
+# These are the key runtime packages used by Person 1.
+opencv-python
+mediapipe
+numpy
+torch
+# Fingerspelling mode
+joblib
+scikit-learn
