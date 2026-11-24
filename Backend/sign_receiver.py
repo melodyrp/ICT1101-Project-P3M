@@ -6,8 +6,16 @@ the recogniser sends one JSON line to this server, for example::
 
     {"type":"sign_sentence","sentence":"want water","confidence":0.81}
 
-The receiver validates the message and calls the backend callback with only the
-final text.  It intentionally does *not* perform TTS or talk to Unit B; those
+Fingerspelling mode sends one message per letter / key instead, so the letters
+appear live on Unit A and Unit A's UNDO / SPACE / SEND edit the same text::
+
+    {"type":"sign_letter","letter":"H","confidence":0.93}
+    {"type":"sign_key","key":"space"}      # space | undo | send | clear | get
+
+For sign_letter / sign_key the reply is ``OK <current spelled text>`` so the
+recogniser window can show exactly what Unit A shows.
+
+The receiver validates the message and calls the backend callback.  It intentionally does *not* perform TTS or talk to Unit B; those
 steps remain the responsibility of Backend/main.py.
 """
 
@@ -30,8 +38,14 @@ class SignReceiver:
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
         report: Callable[[str], None] = print,
+        on_letter: Optional[Callable[[str], None]] = None,
+        on_key: Optional[Callable[[str], None]] = None,
+        get_text: Optional[Callable[[], str]] = None,
     ):
         self.on_sentence = on_sentence
+        self.on_letter = on_letter
+        self.on_key = on_key
+        self.get_text = get_text
         self.host = host
         self.port = int(port)
         self.report = report
@@ -94,7 +108,14 @@ class SignReceiver:
                 payload = json.loads(raw.decode("utf-8"))
                 if not isinstance(payload, dict):
                     raise ValueError("message must be a JSON object")
-                if payload.get("type") != "sign_sentence":
+                kind = payload.get("type")
+                if kind == "sign_letter":
+                    self._handle_letter(conn, payload)
+                    return
+                if kind == "sign_key":
+                    self._handle_key(conn, payload)
+                    return
+                if kind != "sign_sentence":
                     raise ValueError("unsupported message type")
                 text = payload.get("sentence")
                 if not isinstance(text, str) or not text.strip():
@@ -118,3 +139,29 @@ class SignReceiver:
                     pass
             except (OSError, TimeoutError) as error:
                 self.report(f"[sign] connection error from {addr[0]}: {error}")
+
+    # ---------- fingerspelling (one letter / key at a time) ----------
+    def _reply_text(self, conn: socket.socket) -> None:
+        text = self.get_text() if self.get_text else ""
+        try:
+            conn.sendall(("OK " + text + "\n").encode("ascii", "replace"))
+        except OSError:
+            pass
+
+    def _handle_letter(self, conn: socket.socket, payload: dict) -> None:
+        letter = payload.get("letter")
+        if not isinstance(letter, str) or len(letter) != 1 or not (32 <= ord(letter) <= 126):
+            raise ValueError("letter must be one printable ASCII character")
+        if not self.on_letter:
+            raise ValueError("letters are not supported by this backend")
+        self.on_letter(letter)
+        self._reply_text(conn)
+
+    def _handle_key(self, conn: socket.socket, payload: dict) -> None:
+        key = payload.get("key")
+        if key not in ("space", "undo", "backspace", "send", "clear", "get"):
+            raise ValueError("key must be space, undo, send, clear or get")
+        if not self.on_key:
+            raise ValueError("keys are not supported by this backend")
+        self.on_key(key)
+        self._reply_text(conn)

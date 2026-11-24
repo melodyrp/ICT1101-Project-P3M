@@ -7,12 +7,16 @@ The external repository stays OUTSIDE the team Git repository. This script
 loads its pretrained PyTorch weights + label encoder and uses MediaPipe
 HandLandmarker for webcam inference.
 
-Controls
+Every registered letter is sent straight to Backend/main.py (TCP 5560), so it
+shows live on Unit A. The text lives in the backend: Unit A's buttons and the
+keys below edit the same text, and this window shows what Unit A shows.
+
+Controls (same as Unit A's buttons)
 --------
-SPACE      finish current spelled word and append it to the sentence
-BACKSPACE  remove the last letter (or last sentence character if word empty)
-C          clear current word + sentence
-ENTER      finish current word, send the whole sentence to team backend
+SPACE      add a space between words
+BACKSPACE  delete the last letter (= UNDO)
+C          clear everything
+ENTER      speak the text on Unit B (= SEND)
 Q / ESC    quit
 
 Important: J and Z are motion-based ASL letters; a static-frame alphabet model
@@ -34,7 +38,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from fingerspell_bridge import send_text
+from fingerspell_bridge import send_key, send_letter
 
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "fingerspelling_config.json"
@@ -292,8 +296,9 @@ def main():
     stable_needed = int(cfg.get("stable_frames", 12))
     release_needed = int(cfg.get("release_frames", 6))
 
-    current_word = ""
-    sentence_words: list[str] = []
+    spelled = ""          # the text as the backend / Unit A has it
+    online = False
+    next_sync = 0.0
     candidate = ""
     candidate_frames = 0
     last_committed = ""
@@ -357,11 +362,13 @@ def main():
                         release_frames = max(0, release_frames - 1)
 
                     if candidate_frames >= stable_needed and release_frames >= release_needed:
-                        current_word += latest_letter
+                        reply = send_letter(latest_letter, latest_conf)
+                        online = reply is not None
+                        spelled = reply if online else spelled + latest_letter
                         last_committed = latest_letter
                         candidate_frames = 0
                         release_frames = 0
-                        print(f"[Fingerspell] Registered {latest_letter} -> {current_word}")
+                        print(f"[Fingerspell] Registered {latest_letter} -> {spelled}")
                 else:
                     candidate = ""
                     candidate_frames = 0
@@ -378,13 +385,26 @@ def main():
                 if release_frames >= release_needed:
                     last_committed = ""
 
-            sentence_preview = " ".join(sentence_words + ([current_word] if current_word else []))
+            # pick up changes made with Unit A's buttons (UNDO / SPACE / SEND)
+            now = time.monotonic()
+            if now >= next_sync:
+                reply = send_key("get")
+                online = reply is not None
+                if online:
+                    spelled = reply
+                next_sync = now + (0.5 if online else 3.0)
+
+            current_word = spelled.split(" ")[-1]
+            sentence_preview = spelled
             mode = f"FINGERSPELL | {latest_letter or '-'} {latest_conf:.0%}"
             cv2.rectangle(frame, (0, 0), (frame.shape[1], 115), (20, 20, 20), -1)
             cv2.putText(frame, mode, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 255, 0), 2)
             cv2.putText(frame, f"Word: {current_word or '-'}", (15, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255,255,255), 2)
             cv2.putText(frame, f"Sentence: {sentence_preview[-65:] or '-'}", (15, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255,255,255), 2)
-            cv2.putText(frame, "SPACE word | BKSP delete | ENTER send | C clear | Q quit",
+            link = "Unit A link: backend OK" if online else "Backend NOT running - start Backend/main.py"
+            cv2.putText(frame, link, (15, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                        (0, 255, 0) if online else (0, 0, 255), 1)
+            cv2.putText(frame, "SPACE space | BKSP undo | ENTER speak | C clear | Q quit",
                         (12, frame.shape[0]-18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1)
 
             cv2.imshow(str(cfg.get("window_name", "Person 1 - ASL Fingerspelling")), frame)
@@ -393,29 +413,26 @@ def main():
             if key in (ord("q"), 27):
                 break
             if key == ord("c"):
-                current_word = ""
-                sentence_words.clear()
+                reply = send_key("clear")
+                spelled = reply if reply is not None else ""
                 last_committed = ""
-            elif key == 8:  # Backspace
-                if current_word:
-                    current_word = current_word[:-1]
-                elif sentence_words:
-                    last = sentence_words.pop()
-                    current_word = last
+            elif key == 8:  # Backspace = UNDO one letter
+                reply = send_key("undo")
+                spelled = reply if reply is not None else spelled[:-1]
             elif key == 32:  # Space
-                if current_word:
-                    sentence_words.append(current_word)
-                    current_word = ""
+                reply = send_key("space")
+                if reply is not None:
+                    spelled = reply
+                elif spelled and not spelled.endswith(" "):
+                    spelled += " "
+                last_committed = ""
+            elif key in (10, 13):  # Enter = SEND (speak on Unit B)
+                reply = send_key("send")
+                if reply is not None:
+                    spelled = reply
                     last_committed = ""
-            elif key in (10, 13):  # Enter
-                if current_word:
-                    sentence_words.append(current_word)
-                    current_word = ""
-                final_text = " ".join(sentence_words).strip()
-                if final_text:
-                    if send_text(final_text, latest_conf if latest_conf > 0 else None):
-                        sentence_words.clear()
-                        last_committed = ""
+                else:
+                    print("[Fingerspell] Not sent - Backend/main.py is not running.")
 
     cap.release()
     cv2.destroyAllWindows()

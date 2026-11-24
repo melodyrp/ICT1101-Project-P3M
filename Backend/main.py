@@ -1,7 +1,7 @@
 """Main backend / conversation controller (Person 4 + Person 6).
 
 Flow:
-  Signer  --(sign AI, P1, one letter at a time)--> spelling buffer --> shown on Unit A (P2)
+  Signer  --(sign AI, P1, one letter at a time, TCP 5560)--> spelling buffer --> shown on Unit A (P2)
           Unit A buttons: SPACE, UNDO (one letter), SEND --> TTS (P5) --> Unit B speaks (P3)
   Hearing --(mic + STT, P5)--> caption --> Unit A screen
           Unit A button: START/STOP live captions
@@ -17,6 +17,7 @@ Captions always use the real microphone + STT (needs Speech/ set up).
 
 Real hardware:
     python main.py --unitb 192.168.1.25 --unita 192.168.1.30
+Then start SignAI/fingerspell_team.py: each letter it registers appears on Unit A.
 """
 import argparse
 import math
@@ -28,6 +29,7 @@ from pathlib import Path
 
 import unitb_client
 from unita_link import UnitALink
+from sign_receiver import SignReceiver
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_TEXT = 160          # Unit B / Unit A limit
@@ -51,9 +53,9 @@ def tts_beep(text):
 def tts_real(text):
     """Piper (Julia's speech.py), falling back to the Windows voice.
     Reuses Melody's synthesize() so both senders behave the same."""
-    sys.path.insert(0, str(ROOT / 'UnitB' / 'UnitB_WiFiSpeech'))
-    import wifi_sender
-    return wifi_sender.synthesize(text)[1]
+    sys.path.insert(0, str(ROOT / "Speech"))
+    import speech
+    return speech.text_to_pcm(text)
 
 
 # ---- STT (Person 5) : listen once, return what the hearing person said ----
@@ -64,16 +66,20 @@ def stt_real():
 
 
 # ---- Sign recognition (Person 1) ----
-# TODO(P1): call controller.on_sign_letter(ch) once for every letter the model
-# is confident about (e.g. 'H'). Until then, letters typed into this console
-# are used instead (see run()).
+# P1 runs in its own process (SignAI/fingerspell_team.py) and talks to the
+# SignReceiver on TCP 5560 (see sign_receiver.py):
+#   sign_letter -> on_sign_letter(ch)      one recognised letter
+#   sign_key    -> on_sign_key(key)        space / undo / send / clear / get
+#   sign_sentence -> on_sign_sentence(t)   a finished sentence (250-word mode)
+# Letters typed into this console also work (see run()).
 
 
 # =====================================================================
 #  Controller
 # =====================================================================
 class Controller:
-    def __init__(self, unitb_ip, unita_ip, tts, stt):
+    def __init__(self, unitb_ip, unita_ip, tts, stt,
+                 sign_host='127.0.0.1', sign_port=5560, sign_enabled=True):
         self.unitb_ip = unitb_ip
         self.tts, self.stt = tts, stt
         self.spelling = ''                   # letters signed so far, not yet spoken
@@ -85,6 +91,12 @@ class Controller:
         self.running = True
         self.unita = UnitALink(unita_ip, self.on_unita_event, report=log,
                                on_connect=self._push_text) if unita_ip else None
+        self.sign_receiver = (
+            SignReceiver(self.on_sign_sentence, host=sign_host, port=sign_port, report=log,
+                         on_letter=self.on_sign_letter, on_key=self.on_sign_key,
+                         get_text=self.get_spelling)
+            if sign_enabled else None
+        )
 
     # ---------- inputs ----------
     def on_sign_letter(self, ch):
@@ -100,6 +112,34 @@ class Controller:
         log(f'[sign] "{ch}"  -> "{self.spelling}"')
         self._push_text()
 
+    def on_sign_sentence(self, text):
+        """A finished sentence (P1 250-word mode or ENTER in an older GUI)."""
+        text = text.strip()
+        if not text:
+            return
+        if self.unita:
+            self.unita.send_sent(text)
+        self.queue_sentence(text)
+
+    def on_sign_key(self, key):
+        """Keyboard keys from P1's fingerspelling window. Returns the new text."""
+        key = key.lower()
+        if key == 'space':
+            self.add_space()
+        elif key in ('undo', 'backspace'):
+            self.undo_letter()
+        elif key == 'send':
+            self.send()
+        elif key == 'clear':
+            self.clear_spelling()
+        elif key != 'get':
+            log(f'[sign] unknown key ignored: {key!r}')
+        return self.get_spelling()
+
+    def get_spelling(self):
+        with self.text_lock:
+            return self.spelling
+
     def on_unita_event(self, line):
         """Messages from Unit A (see PROTOCOL.md)."""
         log(f'[Unit A] {line}')
@@ -108,7 +148,10 @@ class Controller:
         elif line == 'BTN STOP':
             self.stop_captions()
         elif line == 'BTN UNDO':
-            self.undo_letter()
+            if self.get_spelling():
+                self.undo_letter()     # letters on screen: delete one
+            else:
+                self.undo()            # nothing spelled: cancel last queued sentence
         elif line == 'BTN SPACE':
             self.add_space()
         elif line == 'BTN SEND':
@@ -118,16 +161,38 @@ class Controller:
 
     # ---------- actions ----------
     def start_captions(self):
+        if self.captioning.is_set():
+            log('[stt] captions already ON')
+            return
         self.captioning.set()
         self._status('LISTENING')
         log('[stt] captions ON')
 
     def stop_captions(self):
+        if not self.captioning.is_set():
+            log('[stt] captions already OFF')
+            return
         self.captioning.clear()
         self._status('IDLE')
-        if self.unita:
-            self.unita.send_caption('')
+        self._caption('')
         log('[stt] captions OFF')
+
+    def undo(self):
+        """Cancel the last sentence that is queued but not spoken yet."""
+        with self.cv:
+            removed = self.pending.pop() if self.pending else None
+        if removed:
+            log(f'[undo] removed "{removed}" before it was spoken')
+            self._caption(f'Undone: {removed}')
+        else:
+            log('[undo] nothing to undo (already spoken or queue empty)')
+            self._caption('Nothing to undo')
+
+    def clear_spelling(self):
+        with self.text_lock:
+            self.spelling = ''
+        log('[clear] spelling cleared')
+        self._push_text()
 
     def undo_letter(self):
         with self.text_lock:
@@ -178,6 +243,10 @@ class Controller:
                 text = self.spelling
             self.unita.send_text(text)
 
+    def _caption(self, text):
+        if self.unita:
+            self.unita.send_caption(text)
+
     def _status(self, word):
         if self.unita:
             self.unita.send_status(word)
@@ -213,11 +282,10 @@ class Controller:
                     log(f'[Unit B] attempt {attempt} failed: {error}')
                     if attempt == 1:
                         time.sleep(2)
-            self.speaking.clear()
             if not ok:
-                self._status('NO UNIT B')
-            else:
-                self._status('LISTENING' if self.captioning.is_set() else 'IDLE')
+                self._caption('Unit B not responding')
+            self.speaking.clear()
+            self._status('LISTENING' if self.captioning.is_set() else 'IDLE')
 
     def caption_worker(self):
         """While captions are on, listen and push text to Unit A.
@@ -234,8 +302,7 @@ class Controller:
                 continue
             if text and self.captioning.is_set() and not self.speaking.is_set():
                 log(f'[stt] "{text}"')
-                if self.unita:
-                    self.unita.send_caption(text)
+                self._caption(text)
 
     # ---------- lifecycle ----------
     def run(self):
@@ -246,10 +313,13 @@ class Controller:
             log(f'[tts] warm-up failed: {error}')
         if self.unita:
             self.unita.start()
+        if self.sign_receiver:
+            self.sign_receiver.start()
         threading.Thread(target=self.speaker_worker, daemon=True).start()
         threading.Thread(target=self.caption_worker, daemon=True).start()
         log(f'Unit B {self.unitb_ip}: ' + ('reachable' if unitb_client.ping(self.unitb_ip) else 'NOT reachable yet'))
-        print('\nType letters + Enter (= pretend signing, each character is one letter).\n'
+        print('\nPerson 1 fingerspelling (letters/keys/sentences) is accepted on TCP port 5560.\n'
+              'You can also type letters + Enter here (each character is one letter).\n'
               'Commands: /space /undo /send /start /stop /say <sentence> /quit\n')
         try:
             while True:
@@ -282,6 +352,8 @@ class Controller:
             self.cv.notify_all()
         if self.unita:
             self.unita.stop()
+        if self.sign_receiver:
+            self.sign_receiver.stop()
         log('backend stopped')
 
 
@@ -290,12 +362,18 @@ def main():
     p.add_argument('--unitb', default='127.0.0.1', help='Unit B IP (default: fake on this laptop)')
     p.add_argument('--unita', default='127.0.0.1', help="Unit A IP, or 'none' to run without it")
     p.add_argument('--tts', choices=['real', 'beep'], default='real')
+    p.add_argument('--sign-host', default='127.0.0.1', help='Person 1 sign receiver bind address')
+    p.add_argument('--sign-port', type=int, default=5560, help='Person 1 sign receiver TCP port')
+    p.add_argument('--no-sign', action='store_true', help='disable Person 1 TCP receiver')
     a = p.parse_args()
     Controller(
         unitb_ip=a.unitb,
         unita_ip=None if a.unita.lower() == 'none' else a.unita,
         tts=tts_real if a.tts == 'real' else tts_beep,
         stt=stt_real,
+        sign_host=a.sign_host,
+        sign_port=a.sign_port,
+        sign_enabled=not a.no_sign,
     ).run()
 
 
